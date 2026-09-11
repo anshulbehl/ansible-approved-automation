@@ -1,0 +1,68 @@
+---
+- name: Incidents | Memory Pressure Relief
+  hosts: "{{ target_host | default('all') }}"
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Capture memory usage before remediation
+      ansible.builtin.shell: free | awk '/Mem:/{printf "%d", ($3/$2)*100}'
+      register: mem_before
+      changed_when: false
+
+    - name: Identify top memory-consuming processes
+      ansible.builtin.shell: |
+        ps aux --sort=-%mem | awk 'NR>1 && NR<=6 {printf "%s: %s%% MEM\n", $11, $4}'
+      register: top_mem_procs
+      changed_when: false
+
+    - name: Drop Linux page cache
+      ansible.builtin.shell: sync && echo 3 > /proc/sys/vm/drop_caches
+      changed_when: true
+
+    - name: Clear swap if swap usage is high
+      ansible.builtin.shell: |
+        SWAP_USED=$(free | awk '/Swap:/{printf "%d", ($3/$2)*100}' 2>/dev/null || echo 0)
+        if [ "$SWAP_USED" -gt 50 ] 2>/dev/null; then
+          swapoff -a && swapon -a
+          echo "swap_cleared"
+        else
+          echo "swap_ok"
+        fi
+      register: swap_result
+      changed_when: "'swap_cleared' in swap_result.stdout"
+      ignore_errors: true
+
+    - name: Restart memory-leaking app service if identified
+      ansible.builtin.systemd:
+        name: "{{ leak_service | default('httpd') }}"
+        state: restarted
+      ignore_errors: true
+      when: leak_service is defined
+
+    - name: Capture memory usage after remediation
+      ansible.builtin.shell: free | awk '/Mem:/{printf "%d", ($3/$2)*100}'
+      register: mem_after
+      changed_when: false
+
+    - name: Report results
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          MEMORY PRESSURE RELIEF COMPLETE
+          ============================================================
+          Memory before: {{ mem_before.stdout }}%
+          Memory after:  {{ mem_after.stdout }}%
+          Freed:         {{ mem_before.stdout | int - mem_after.stdout | int }}%
+          Swap action:   {{ swap_result.stdout | trim }}
+          Top consumers: {{ top_mem_procs.stdout }}
+          ============================================================
+
+    - name: Publish remediation artifacts
+      ansible.builtin.set_stats:
+        data:
+          memory_before_pct: "{{ mem_before.stdout | trim }}"
+          memory_after_pct: "{{ mem_after.stdout | trim }}"
+          swap_action: "{{ swap_result.stdout | trim }}"
+          status: "completed"
+        per_host: false
